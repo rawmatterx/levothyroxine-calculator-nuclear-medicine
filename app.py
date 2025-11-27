@@ -273,7 +273,7 @@ def calculate_lt4_and_targets(inputs: dict) -> dict:
     else:
         mcg_kg_min = mcg_kg_max = 0
 
-        # Dose adjustment suggestion (now considers current dose vs recommended range)
+            # Dose adjustment suggestion (now considers current dose vs recommended range)
     dose_adjustment_suggestion = None
     if current_lt4 is not None and current_tsh is not None:
         # Where is the current dose relative to the recommended range?
@@ -288,7 +288,7 @@ def calculate_lt4_and_targets(inputs: dict) -> dict:
             # TSH too high -> under-treated
             if dose_position == "below":
                 delta = 12.5 if high_cv_risk else 25.0
-                new_target = min(central, mcg_max)
+                new_target = min(suggested_central_mcg_day, mcg_max)
                 dose_adjustment_suggestion = (
                     f"TSH above target and current dose is below the recommended range – "
                     f"consider titrating up towards ~{new_target:.0f} mcg/day "
@@ -311,7 +311,7 @@ def calculate_lt4_and_targets(inputs: dict) -> dict:
             # TSH too low -> over-treated
             if dose_position == "above":
                 delta = 12.5 if (high_cv_risk or high_bone_risk) else 25.0
-                new_target = max(central, mcg_min)
+                new_target = max(suggested_central_mcg_day, mcg_min)
                 dose_adjustment_suggestion = (
                     f"TSH below target and current dose is above the recommended range – "
                     f"consider titrating down towards ~{new_target:.0f} mcg/day "
