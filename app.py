@@ -2,7 +2,7 @@ import math
 import streamlit as st
 
 # ==========================================
-# 1. INDIAN MARKET UTILITIES & DATA
+# 1. INDIAN MARKET UTILITIES
 # ==========================================
 
 def get_nearest_indian_tablet(target_dose: float) -> str:
@@ -38,7 +38,7 @@ def compute_bmi(weight_kg: float, height_cm: float | None) -> float | None:
 
 def compute_effective_weight(weight_kg: float, height_cm: float | None) -> float:
     """
-    Adjusts weight for obesity to prevent overdosing in high BMI patients.
+    Adjusts weight for obesity to prevent overdosing.
     """
     bmi = compute_bmi(weight_kg, height_cm)
     if bmi is None or bmi < 30: 
@@ -50,9 +50,40 @@ def compute_effective_weight(weight_kg: float, height_cm: float | None) -> float
     adjusted_weight = ideal_weight + 0.4 * (weight_kg - ideal_weight)
     return max(ideal_weight, min(weight_kg, adjusted_weight))
 
+def apply_smart_switch_protocol(
+    indication: str, 
+    current_lt4: float, 
+    current_tsh: float, 
+    calculated_weight_based_dose: float
+) -> tuple[float, str]:
+    """
+    The 'Smart Switch' Logic for Benign Hypothyroidism Initiation.
+    Prevents overdosing mild cases.
+    Returns: (New Dose, Explanation String)
+    """
+    # Only applies to Benign Hypo cases who are NOT yet on medication (Naive)
+    if indication != "Benign Hypothyroidism" or current_lt4 > 0:
+        return calculated_weight_based_dose, "Weight-based Calculation"
+
+    # TSH MILD (4 - 10)
+    if current_tsh < 10:
+        # Start Low (25-50)
+        smart_dose = 25.0 if calculated_weight_based_dose < 75 else 50.0
+        return smart_dose, "Smart Switch: Graded Start (TSH < 10)"
+
+    # TSH MODERATE (10 - 20)
+    elif current_tsh < 20:
+        # Start Medium (50-75)
+        smart_dose = 50.0 if calculated_weight_based_dose < 100 else 75.0
+        return smart_dose, "Smart Switch: Graded Start (TSH 10-20)"
+
+    # TSH SEVERE (> 20) -> Full Replacement
+    else:
+        return calculated_weight_based_dose, "Full Weight-based Replacement (TSH > 20)"
+
 def map_ata_risk_and_response(risk: str, response: str, years_since_surgery: float | None) -> str:
     """
-    Determines suppression intensity (None/Mild/Mod/Strong) based on DTC Risk + Response.
+    Determines suppression intensity based on Cancer Risk + Response.
     """
     risk = (risk or "").lower()
     response = (response or "").lower()
@@ -77,9 +108,6 @@ def map_ata_risk_and_response(risk: str, response: str, years_since_surgery: flo
     return "Mild"
 
 def soften_suppression_level(level: str, high_cv_risk: bool, high_bone_risk: bool, pregnancy: bool) -> str:
-    """
-    Downgrades suppression targets if patient has comorbidities or is pregnant.
-    """
     # Pregnancy safety override
     if pregnancy and level == "Strong":
         return "Moderate" 
@@ -93,23 +121,17 @@ def soften_suppression_level(level: str, high_cv_risk: bool, high_bone_risk: boo
     return order[new_idx]
 
 def get_tsh_targets(scenario: str, suppression_level: str, pregnancy_status: str) -> tuple[float, float]:
-    # 1. PREGNANCY LOGIC (Overrides others)
+    # 1. PREGNANCY LOGIC
     if pregnancy_status in ["Trimester 1", "Trimester 2", "Trimester 3"]:
-        if pregnancy_status == "Trimester 1":
-            return (0.1, 2.5)
-        else:
-            return (0.2, 3.0)
+        if pregnancy_status == "Trimester 1": return (0.1, 2.5)
+        else: return (0.2, 3.0)
 
     # 2. PLANNING PREGNANCY
-    if pregnancy_status == "Planning Pregnancy":
-        return (0.5, 2.5)
+    if pregnancy_status == "Planning Pregnancy": return (0.5, 2.5)
 
     # 3. STANDARD SCENARIOS
-    if scenario == "C": # Benign Hypo
-        return (0.4, 4.0)
-    
-    if scenario == "A": # Post-RAI (Hyper)
-        return (0.5, 2.5)
+    if scenario == "C": return (0.4, 4.0) # Benign
+    if scenario == "A": return (0.5, 2.5) # Post-RAI
 
     # Scenario B: Cancer
     level = (suppression_level or "None").capitalize()
@@ -133,7 +155,7 @@ def base_replacement_mcg_per_kg(age: int, high_cv_risk: bool, indication: str) -
         return base
 
 # ==========================================
-# 3. TITRATION LOGIC (THE SAFETY FIX)
+# 3. TITRATION LOGIC (SAFE STEP)
 # ==========================================
 
 def calculate_titration_step(
@@ -146,23 +168,20 @@ def calculate_titration_step(
     pregnancy_status: str
 ) -> tuple[str, float]:
     """
-    Returns a TUPLE: (Advice Text, Safe Next Dose)
-    This prevents the app from suggesting massive jumps (e.g. 50->112) in one go.
+    Returns: (Advice Text, Safe Next Dose)
+    Prevents massive jumps in dosage.
     """
     is_pregnant = pregnancy_status in ["Trimester 1", "Trimester 2", "Trimester 3"]
 
     # CASE 0: Naive Patient (Not on meds)
     if current_lt4 <= 0:
-        if high_cv_risk and not is_pregnant:
-            return ("Initiate conservatively due to CV risk.", 25.0)
-        return ("Initiate full calculated replacement.", ideal_lt4)
+        # If we reached here, 'ideal_lt4' has already been filtered by Smart Switch or Weight logic
+        return ("Initiate therapy.", ideal_lt4)
 
-    # CASE 1: Pregnancy (Urgent & Aggressive)
+    # CASE 1: Pregnancy (Urgent)
     if is_pregnant:
         if current_tsh > t_high:
-            # ATA Rule: Immediate ~25-30% increase
-            safe_next = current_lt4 * 1.25
-            # Round to nearest logical step (e.g., +25mcg)
+            safe_next = current_lt4 * 1.25 # Y-Rule
             return ("🚨 **Pregnant:** Increase dose by ~25-30% immediately.", safe_next)
     
     dose_gap = ideal_lt4 - current_lt4
@@ -175,10 +194,10 @@ def calculate_titration_step(
         else:
             # No CV Risk
             if dose_gap > 25:
-                # Large gap (e.g., 50 -> 112). Don't jump. Step +25.
+                # Large gap. Step +25.
                 return (f"TSH High. Large gap to target. Increase by 25 mcg (Step 1).", current_lt4 + 25.0)
             elif dose_gap > 12.5:
-                return (f"TSH High. Increase by 12.5 - 25 mcg.", current_lt4 + 12.5) # Conservative step
+                return (f"TSH High. Increase by 12.5 - 25 mcg.", current_lt4 + 12.5) 
             else:
                 return (f"TSH High. Adjust to target.", ideal_lt4)
 
@@ -192,7 +211,6 @@ def calculate_titration_step(
     # CASE 4: On Target
     return ("TSH on target. Continue current dose.", current_lt4)
 
-
 def build_safety_flags(age, high_cv_risk, high_bone_risk, pregnancy_status, diabetes, suggested_mcg, effective_weight, current_tsh, suppression_level):
     flags = []
     if high_cv_risk: flags.append("⚠️ **High CV Risk:** Start low, go slow (12.5mcg steps).")
@@ -205,7 +223,7 @@ def build_safety_flags(age, high_cv_risk, high_bone_risk, pregnancy_status, diab
     return flags
 
 def calculate_lt4_and_targets(inputs: dict) -> dict:
-    # Unpack inputs
+    # Unpack
     age = inputs["age"]
     sex = inputs["sex"]
     weight_kg = inputs["weight_kg"]
@@ -228,7 +246,7 @@ def calculate_lt4_and_targets(inputs: dict) -> dict:
         suppression_level = map_ata_risk_and_response(inputs.get("initial_ata_risk"), inputs.get("disease_status"), inputs.get("time_since_surgery_years"))
         suppression_level = soften_suppression_level(suppression_level, high_cv_risk, high_bone_risk, preg_status != "Non-pregnant")
 
-    # Targets & Dosing
+    # Targets
     tsh_low, tsh_high = get_tsh_targets(scenario, suppression_level, preg_status)
     effective_weight = compute_effective_weight(weight_kg, height_cm)
     base_mcg = base_replacement_mcg_per_kg(age, high_cv_risk, indication)
@@ -240,30 +258,39 @@ def calculate_lt4_and_targets(inputs: dict) -> dict:
         elif suppression_level == "Moderate": factor = 1.2
         elif suppression_level == "Strong": factor = 1.3
     
-    ideal_dose = base_mcg * effective_weight * factor
+    # 1. Calculate Theoretical Weight-Based Dose
+    theoretical_dose = base_mcg * effective_weight * factor
     
-    # Pregnancy Boost (The Y-Rule)
+    # 2. APPLY SMART SWITCH (Benign Initiation Logic)
+    # This modifies the "Ideal" based on TSH severity if naive
+    current_lt4 = inputs.get("current_lt4", 0)
+    current_tsh = inputs.get("current_tsh", 5.0)
+    
+    ideal_dose, calculation_method_note = apply_smart_switch_protocol(
+        indication, current_lt4, current_tsh, theoretical_dose
+    )
+
+    # 3. Pregnancy Boost (The Y-Rule) - Applies on top
     if preg_status in ["Trimester 1", "Trimester 2", "Trimester 3"]:
-        current = inputs.get("current_lt4", 0)
-        # If already on meds, increase by 25%. If naive, calc is already done above.
-        if current > 0: ideal_dose = current * 1.25
+        if current_lt4 > 0: ideal_dose = current_lt4 * 1.25
 
     if ideal_dose > 300: ideal_dose = 300
 
-    # Titration & Safety
+    # 4. Titration & Safety (The Safe Next Step)
     titration_text, safe_next_dose = calculate_titration_step(
-        inputs.get("current_lt4", 0), ideal_dose, inputs.get("current_tsh", 0), 
+        current_lt4, ideal_dose, current_tsh, 
         tsh_high, tsh_low, high_cv_risk, preg_status
     )
 
-    safety_flags = build_safety_flags(age, high_cv_risk, high_bone_risk, preg_status, inputs.get("diabetes"), ideal_dose, effective_weight, inputs.get("current_tsh"), suppression_level)
+    safety_flags = build_safety_flags(age, high_cv_risk, high_bone_risk, preg_status, inputs.get("diabetes"), ideal_dose, effective_weight, current_tsh, suppression_level)
 
     return {
         "scenario": scenario,
         "suppression_level": suppression_level,
         "tsh_target_range": (tsh_low, tsh_high),
         "ideal_calculated_dose": ideal_dose,
-        "safe_next_dose": safe_next_dose,      # The Safe Step
+        "calculation_note": calculation_method_note, # Added note about method
+        "safe_next_dose": safe_next_dose,
         "titration_note": titration_text,
         "safety_flags": safety_flags,
         "effective_weight": effective_weight
@@ -274,9 +301,9 @@ def calculate_lt4_and_targets(inputs: dict) -> dict:
 # ==========================================
 
 def main():
-    st.set_page_config(page_title="Thyroid Calc v2.1 (Safe Titration)", layout="wide")
-    st.title("🇮🇳 Thyroid CDSS: Pregnancy & Oncology")
-    st.markdown("**Indian Standard of Care | ATA 2024/2025 Guidelines**")
+    st.set_page_config(page_title="Thyroid Calc v3.0 (Smart Switch)", layout="wide")
+    st.title("🇮🇳 Thyroid CDSS: Smart Protocol")
+    st.markdown("**Indian Context | ATA 2025 | Smart Switch Enabled**")
 
     # --- SIDEBAR ---
     with st.sidebar:
@@ -313,8 +340,8 @@ def main():
             inputs["osteoporosis"] = st.checkbox("Osteoporosis")
 
         st.header("4. Current Status")
-        inputs["current_lt4"] = st.number_input("Current Dose (mcg)", 0.0, 300.0, 50.0, step=12.5)
-        inputs["current_tsh"] = st.number_input("Current TSH (mIU/L)", 0.0, 150.0, 4.5, step=0.1)
+        inputs["current_lt4"] = st.number_input("Current Dose (mcg) - 0 if Naive", 0.0, 300.0, 50.0, step=12.5)
+        inputs["current_tsh"] = st.number_input("Current TSH (mIU/L)", 0.0, 150.0, 8.5, step=0.1)
 
         btn_calc = st.button("Calculate Prescription", type="primary")
 
@@ -330,10 +357,13 @@ def main():
             t_low, t_high = res['tsh_target_range']
             st.metric("Target TSH Range", f"{t_low} - {t_high} mIU/L")
             
-            if pregnancy_status != "Non-pregnant":
-                 st.info(f"**Pregnancy:** Range adjusted for {pregnancy_status}.")
+            # Context Flags
+            if "Smart Switch" in res['calculation_note']:
+                st.info(f"🧠 **Protocol:** {res['calculation_note']}")
+            elif pregnancy_status != "Non-pregnant":
+                 st.info(f"🤰 **Pregnancy:** Range adjusted for {pregnancy_status}.")
             elif res['scenario'] == "B":
-                 st.info(f"**Oncology:** {res['suppression_level']} Suppression")
+                 st.info(f"🎗️ **Oncology:** {res['suppression_level']} Suppression")
 
             if res['safety_flags']:
                 st.warning("⚠️ **Safety Alerts:**")
@@ -343,17 +373,16 @@ def main():
         with col_main_2:
             st.subheader("💊 Prescription Guide")
             
-            # --- SAFETY FIX DISPLAY LOGIC ---
-            # 1. We display the SAFE NEXT STEP in the Green Box
+            # --- SAFE DISPLAY LOGIC ---
             safe_dose_sku = get_nearest_indian_tablet(res['safe_next_dose'])
             
             st.success(f"**Prescribe Today:** {safe_dose_sku}")
             
-            # 2. We display the Long Term Goal separately if it differs
+            # Show Long Term Goal if different
             if abs(res['safe_next_dose'] - res['ideal_calculated_dose']) > 10:
                 st.info(f"🏁 **Long Term Goal:** ~{res['ideal_calculated_dose']:.0f} mcg\n\n(Re-titrate after 6-8 weeks)")
             else:
-                st.caption(f"Calculated Ideal Body Weight Dose: {res['ideal_calculated_dose']:.0f} mcg")
+                st.caption(f"Based on: {res['calculation_note']}")
 
             st.caption("Brands: Thyronorm, Eltroxin, Lethyrox")
             
